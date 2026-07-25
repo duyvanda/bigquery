@@ -81,9 +81,16 @@ def export_staging_metadata():
     print("===================================================================")
 
     # 3. Xuất file Excel định dạng chuẩn đẹp
-    print(f"\n3. Đang ghi file Excel tại: {EXCEL_OUTPUT_PATH}...")
+    save_path = EXCEL_OUTPUT_PATH
+    try:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+    except Exception:
+        save_path = r'd:\bigquery\report_staging_tables_metadata_moi.xlsx'
+
+    print(f"\n3. Đang ghi file Excel tại: {save_path}...")
     
-    with pd.ExcelWriter(EXCEL_OUTPUT_PATH, engine='openpyxl') as writer:
+    with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Staging Tables Metadata')
         
         workbook = writer.book
@@ -141,7 +148,7 @@ def export_staging_metadata():
             col_letter = get_column_letter(col[0].column)
             worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-    print(f"\n[+] XUẤT BÁO CÁO THÀNH CÔNG TẠI: {EXCEL_OUTPUT_PATH}")
+    print(f"\n[+] XUẤT BÁO CÁO THÀNH CÔNG TẠI: {save_path}")
 
 if __name__ == '__main__':
     export_staging_metadata()
