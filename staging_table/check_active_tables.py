@@ -22,8 +22,8 @@ os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
 client = bigquery.Client(project=PROJECT_ID)
 
 # RULE CHECK ACTIVES:
-# Active = (Có query trong 180d) OR (Nằm trong 107 Active SPs) OR (Nằm trong Active Views)
-# Unused = (Không query 180d) AND (Không nằm trong Active SPs) AND (Không nằm trong Active Views)
+# Active = (Có query nghiệp vụ trong 180d) OR (Nằm trong 107 Active SPs) OR (Nằm trong Active Views)
+# Bỏ qua các query tự động 'SELECT * FROM ...' do script sao lưu backup chạy!
 
 def get_active_sp_names():
     active_sps = set()
@@ -98,7 +98,7 @@ def fetch_table_info(item, table_job_usage, referenced_in_code):
 
 def analyze_staging_tables():
     print("==========================================")
-    print("PHÂN TÍCH USAGE DATASET STAGING TABLES (CHUẨN RULE 3 TIÊU CHÍ)")
+    print("PHÂN TÍCH CHUẨN XÁC USAGE TABLES DATASET STAGING (LOẠI BỎ QUERY BACKUP)")
     print("==========================================\n")
 
     # 1. Đọc danh sách Active SPs từ call_active_job.md
@@ -112,7 +112,7 @@ def analyze_staging_tables():
     table_names = [t.table_id for t in base_tables]
     print(f"-> Tìm thấy {len(base_tables)} Base Tables trong dataset '{DATASET_ID}'.")
 
-    # 3. Lịch sử Query (JOBS 180 ngày)
+    # 3. Lịch sử Query (JOBS 180 ngày) - BỎ QUA SELECT * SAO LƯU
     print("\n3. Đang đọc lịch sử Query (180d) từ BigQuery JOBS...")
     query_jobs = f"""
     SELECT 
@@ -123,6 +123,7 @@ def analyze_staging_tables():
     FROM `region-asia-southeast1`.INFORMATION_SCHEMA.JOBS
     WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 180 DAY)
       AND (LOWER(query) LIKE '%{DATASET_ID}%' OR LOWER(query) LIKE '%table%')
+      AND NOT (LOWER(query) LIKE 'select * from%' AND user_email = 'bigquery@spatial-vision-343005.iam.gserviceaccount.com')
     GROUP BY raw_tbl
     HAVING raw_tbl IS NOT NULL
     """
@@ -136,7 +137,7 @@ def analyze_staging_tables():
                 'total_queries': row.total_queries,
                 'user_emails': row.user_emails or ''
             }
-        print(f"-> Ghi nhận {len(table_job_usage)} Tables có lịch sử truy vấn trong 180 ngày.")
+        print(f"-> Ghi nhận {len(table_job_usage)} Tables có lịch sử truy vấn thực sự trong 180 ngày.")
     except Exception as e:
         print(f"[!] Lỗi truy vấn JOBS: {e}")
 
@@ -189,13 +190,13 @@ def analyze_staging_tables():
     active_count = len(df[df['Trạng thái'].str.startswith('Active')])
     unused_count = len(df) - active_count
     
-    print("\n================ KẾT QUẢ TỔNG HỢP STAGING TABLES ================")
-    print(f"Tổng số Base Tables trong 'staging': {len(df)}")
-    print(f"  - Tables ĐANG SỬ DỤNG (Active): {active_count}")
-    print(f"  - Tables LÂU CHƯA QUERY / UNUSED: {unused_count}")
-    print("=================================================================")
+    print("\n================ KẾT QUẢ TỔNG HỢP STAGING TABLES CHUẨN KHOA HỌC ================")
+    print(f"Tổng số Base Tables còn lại trong 'staging': {len(df)}")
+    print(f"  - Tables ĐANG SỬ DỤNG TRỰC TIẾP (Active): {active_count}")
+    print(f"  - Tables LÂU CHƯA QUERY / UNUSED THẬT SỰ: {unused_count}")
+    print("==================================================================================")
 
-    # 6. Xuất Excel định dạng chuẩn đẹp
+    # 6. Xuất Excel
     excel_path = EXCEL_REPORT_PATH
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Staging Tables Usage')
@@ -203,7 +204,7 @@ def analyze_staging_tables():
         workbook = writer.book
         worksheet = writer.sheets['Staging Tables Usage']
         
-        header_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid') # Navy Blue
+        header_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid')
         header_font = Font(name='Segoe UI', size=11, bold=True, color='FFFFFF')
         header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
         
@@ -259,7 +260,7 @@ def analyze_staging_tables():
             col_letter = get_column_letter(col[0].column)
             worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-    print(f"\n[+] Đã xuất báo cáo Excel chuẩn rule tại: {EXCEL_REPORT_PATH}")
+    print(f"\n[+] Đã xuất báo cáo Excel chuẩn loại trừ query backup tại: {EXCEL_REPORT_PATH}")
 
 if __name__ == '__main__':
     analyze_staging_tables()
