@@ -21,6 +21,10 @@ ACTIVE_JOB_FILE = r'd:\bigquery\sp_handle\call_active_job.md'
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
 client = bigquery.Client(project=PROJECT_ID)
 
+# RULE CHECK ACTIVES:
+# Active = (Có query trong 180d) OR (Nằm trong 107 Active SPs) OR (Nằm trong Active Views)
+# Unused = (Không query 180d) AND (Không nằm trong Active SPs) AND (Không nằm trong Active Views)
+
 def get_active_sp_names():
     active_sps = set()
     if not os.path.exists(ACTIVE_JOB_FILE):
@@ -58,15 +62,21 @@ def fetch_table_info(item, table_job_usage, referenced_in_code):
         has_code_ref = len(code_refs) > 0
         code_ref_str = ", ".join(sorted(list(code_refs))) if has_code_ref else 'Không có'
         
+        # RULE 3 TIÊU CHÍ
         is_active = has_job_query or has_code_ref
         
         sources = []
-        if has_code_ref:
-            sources.append("Trong Active SP/View")
         if has_job_query:
-            sources.append("Query history 180d")
-        source_str = " + ".join(sources) if sources else "Không có"
-        
+            sources.append("Query history (180d)")
+        if has_code_ref:
+            sp_count = sum(1 for r in code_refs if r.startswith("Active SP"))
+            view_count = sum(1 for r in code_refs if r.startswith("Active View"))
+            if sp_count > 0:
+                sources.append(f"Active SP ({sp_count})")
+            if view_count > 0:
+                sources.append(f"Active View ({view_count})")
+                
+        source_str = " + ".join(sources) if sources else "Hoàn toàn không sử dụng"
         status = 'Active (Đang sử dụng)' if is_active else 'Lâu chưa query / Unused'
             
         return {
@@ -80,7 +90,7 @@ def fetch_table_info(item, table_job_usage, referenced_in_code):
             'Lần cuối cập nhật dữ liệu (Modified)': modified_str,
             'Lần cuối Query (JOBS 180d)': last_queried_str,
             'Tài khoản/BI Tool query': users_str,
-            'Tham chiếu trong Active Code': 'Có' if has_code_ref else 'Không',
+            'Tham chiếu trong Code (Active SP/View)': 'Có' if has_code_ref else 'Không',
             'Chi tiết Code tham chiếu': code_ref_str
         }
     except Exception as e:
@@ -88,7 +98,7 @@ def fetch_table_info(item, table_job_usage, referenced_in_code):
 
 def analyze_staging_tables():
     print("==========================================")
-    print("PHÂN TÍCH CHUẨN XÁC USAGE TABLES DATASET STAGING (30 THREADS)")
+    print("PHÂN TÍCH USAGE DATASET STAGING TABLES (CHUẨN RULE 3 TIÊU CHÍ)")
     print("==========================================\n")
 
     # 1. Đọc danh sách Active SPs từ call_active_job.md
@@ -131,7 +141,7 @@ def analyze_staging_tables():
         print(f"[!] Lỗi truy vấn JOBS: {e}")
 
     # 4. Quét tham chiếu CHỈ TRONG ACTIVE SPs & Active Views
-    print("\n4. Đang quét tham chiếu Table trong Active SPs (107 SPs) & Views (212 Views)...")
+    print("\n4. Đang quét tham chiếu Table trong Active SPs (107 SPs) & Active Views (warehouse_view)...")
     sp_files = glob.glob(r'd:\bigquery\staging_temp\*.sql')
     view_files = glob.glob(r'd:\bigquery\warehouse_view\*.sql')
     
@@ -157,7 +167,7 @@ def analyze_staging_tables():
         for tn in table_names:
             tn_lower = tn.lower()
             if f"staging.{tn_lower}" in content or f"`staging`.`{tn_lower}`" in content:
-                referenced_in_code.setdefault(tn, set()).add(f"View: {v_name}")
+                referenced_in_code.setdefault(tn, set()).add(f"Active View: {v_name}")
 
     print(f"-> {len(referenced_in_code)} Tables được tham chiếu trực tiếp trong Active SP/View.")
 
@@ -179,17 +189,77 @@ def analyze_staging_tables():
     active_count = len(df[df['Trạng thái'].str.startswith('Active')])
     unused_count = len(df) - active_count
     
-    print("\n================ KẾT QUẢ TỔNG HỢP STAGING TABLES (CHÍNH XÁC) ================")
-    print(f"Tổng số Base Tables còn lại trong 'staging': {len(df)}")
+    print("\n================ KẾT QUẢ TỔNG HỢP STAGING TABLES ================")
+    print(f"Tổng số Base Tables trong 'staging': {len(df)}")
     print(f"  - Tables ĐANG SỬ DỤNG (Active): {active_count}")
-    print(f"  - Tables LÂU CHƯA QUERY / UNUSED THẬT SỰ: {unused_count}")
-    print("==============================================================================")
+    print(f"  - Tables LÂU CHƯA QUERY / UNUSED: {unused_count}")
+    print("=================================================================")
 
-    # 6. Xuất Excel
-    with pd.ExcelWriter(EXCEL_REPORT_PATH, engine='openpyxl') as writer:
+    # 6. Xuất Excel định dạng chuẩn đẹp
+    excel_path = EXCEL_REPORT_PATH
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Staging Tables Usage')
+        
+        workbook = writer.book
+        worksheet = writer.sheets['Staging Tables Usage']
+        
+        header_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid') # Navy Blue
+        header_font = Font(name='Segoe UI', size=11, bold=True, color='FFFFFF')
+        header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        
+        thin_border = Border(
+            left=Side(style='thin', color='D9D9D9'),
+            right=Side(style='thin', color='D9D9D9'),
+            top=Side(style='thin', color='D9D9D9'),
+            bottom=Side(style='thin', color='D9D9D9')
+        )
+        
+        for col_num, col_name in enumerate(df.columns, 1):
+            cell = worksheet.cell(row=1, column=col_num)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_align
+            
+        worksheet.row_dimensions[1].height = 28
+        
+        data_font = Font(name='Segoe UI', size=10)
+        center_align = Alignment(horizontal='center', vertical='center')
+        left_align = Alignment(horizontal='left', vertical='center')
+        right_align = Alignment(horizontal='right', vertical='center')
+        zebra_fill = PatternFill(start_color='F9FAFB', end_color='F9FAFB', fill_type='solid')
+        
+        for row_num in range(2, len(df) + 2):
+            worksheet.row_dimensions[row_num].height = 20
+            use_zebra = (row_num % 2 == 1)
+            
+            is_active_row = df.iloc[row_num - 2]['Trạng thái'].startswith('Active')
+            
+            for col_num in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=row_num, column=col_num)
+                cell.font = data_font
+                cell.border = thin_border
+                if use_zebra:
+                    cell.fill = zebra_fill
+                    
+                if col_num in [1, 3, 5, 7, 8, 9, 10, 11]:
+                    cell.alignment = center_align
+                elif col_num in [5, 6]:
+                    cell.alignment = right_align
+                elif col_num == 4:
+                    cell.alignment = center_align
+                    if is_active_row:
+                        cell.font = Font(name='Segoe UI', size=10, color='385723', bold=True)
+                    else:
+                        cell.font = Font(name='Segoe UI', size=10, color='C00000', italic=True)
+                else:
+                    cell.alignment = left_align
+                    
+        for col in worksheet.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = get_column_letter(col[0].column)
+            worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-    print(f"\n[+] Đã cập nhật báo cáo Excel tại: {EXCEL_REPORT_PATH}")
+    print(f"\n[+] Đã xuất báo cáo Excel chuẩn rule tại: {EXCEL_REPORT_PATH}")
 
 if __name__ == '__main__':
     analyze_staging_tables()

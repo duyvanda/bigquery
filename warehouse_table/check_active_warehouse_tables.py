@@ -4,6 +4,7 @@ import re
 import sys
 import pandas as pd
 import openpyxl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from google.cloud import bigquery
@@ -15,23 +16,104 @@ CREDENTIALS_PATH = 'D:/bigquery1508.json'
 PROJECT_ID = 'spatial-vision-343005'
 DATASET_ID = 'warehouse'
 EXCEL_REPORT_PATH = r'd:\bigquery\danh_sach_table_warehouse_usage.xlsx'
+ACTIVE_JOB_FILE = r'd:\bigquery\sp_handle\call_active_job.md'
 
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
 client = bigquery.Client(project=PROJECT_ID)
 
+# RULE CHECK ACTIVES:
+# Active = (Có query trong 180d) OR (Nằm trong 107 Active SPs) OR (Nằm trong Active Views)
+# Unused = (Không query 180d) AND (Không nằm trong Active SPs) AND (Không nằm trong Active Views)
+
+def get_active_sp_names():
+    active_sps = set()
+    if not os.path.exists(ACTIVE_JOB_FILE):
+        return active_sps
+    with open(ACTIVE_JOB_FILE, 'r', encoding='utf-8') as f:
+        text = f.read()
+    for line in text.split('\n'):
+        for c in line.split(';'):
+            c = c.strip()
+            if 'CALL' in c.upper():
+                parts = c.split('.')
+                if len(parts) >= 2:
+                    sp_name = parts[-1].replace('`', '').replace('()', '').strip().lower()
+                    if sp_name:
+                        active_sps.add(sp_name)
+    return active_sps
+
+def fetch_table_info(item, table_job_usage, referenced_in_code):
+    try:
+        t_obj = client.get_table(item.reference)
+        t_id = t_obj.table_id
+        
+        created_str = t_obj.created.strftime('%Y-%m-%d %H:%M:%S') if t_obj.created else ''
+        modified_str = t_obj.modified.strftime('%Y-%m-%d %H:%M:%S') if t_obj.modified else ''
+        
+        num_rows = t_obj.num_rows if t_obj.num_rows is not None else 0
+        size_mb = round((t_obj.num_bytes or 0) / (1024 * 1024), 2)
+        
+        job_info = table_job_usage.get(t_id)
+        has_job_query = job_info is not None
+        last_queried_str = job_info['last_queried'].strftime('%Y-%m-%d %H:%M:%S') if has_job_query else 'Không query trong 180d'
+        users_str = job_info['user_emails'] if has_job_query else 'Không có'
+        
+        code_refs = referenced_in_code.get(t_id, set())
+        has_code_ref = len(code_refs) > 0
+        code_ref_str = ", ".join(sorted(list(code_refs))) if has_code_ref else 'Không có'
+        
+        # RULE 3 TIÊU CHÍ
+        is_active = has_job_query or has_code_ref
+        
+        sources = []
+        if has_job_query:
+            sources.append("Query history (180d)")
+        if has_code_ref:
+            sp_count = sum(1 for r in code_refs if r.startswith("Active SP"))
+            view_count = sum(1 for r in code_refs if r.startswith("Active View"))
+            if sp_count > 0:
+                sources.append(f"Active SP ({sp_count})")
+            if view_count > 0:
+                sources.append(f"Active View ({view_count})")
+                
+        source_str = " + ".join(sources) if sources else "Hoàn toàn không sử dụng"
+        status = 'Active (Đang sử dụng)' if is_active else 'Lâu chưa query / Unused'
+            
+        return {
+            'Tên Base Table': t_id,
+            'Dataset': DATASET_ID,
+            'Trạng thái': status,
+            'Nguồn ghi nhận Usage': source_str,
+            'Số dòng (Rows)': num_rows,
+            'Dung lượng (MB)': size_mb,
+            'Ngày tạo (Created)': created_str,
+            'Lần cuối cập nhật dữ liệu (Modified)': modified_str,
+            'Lần cuối Query (JOBS 180d)': last_queried_str,
+            'Tài khoản/BI Tool query': users_str,
+            'Tham chiếu trong Code (Active SP/View)': 'Có' if has_code_ref else 'Không',
+            'Chi tiết Code tham chiếu': code_ref_str
+        }
+    except Exception as e:
+        return None
+
 def analyze_warehouse_tables():
     print("==========================================")
-    print("PHÂN TÍCH USAGE BASE TABLES TRONG DATASET WAREHOUSE")
+    print("PHÂN TÍCH BASE TABLES WAREHOUSE (CHUẨN RULE 3 TIÊU CHÍ)")
     print("==========================================\n")
 
-    # 1. Lấy danh sách BASE TABLES (loại bỏ VIEWs)
-    print(f"1. Đang lọc danh sách Base Tables trong dataset '{DATASET_ID}'...")
+    # 1. Đọc danh sách Active SPs từ call_active_job.md
+    active_sp_set = get_active_sp_names()
+    print(f"1. Đã tải {len(active_sp_set)} Active Stored Procedures từ call_active_job.md.")
+
+    # 2. Lấy danh sách Base Tables trong dataset 'warehouse'
+    print(f"2. Đang lấy danh sách Base Tables từ BigQuery Dataset '{DATASET_ID}'...")
     all_items = list(client.list_tables(DATASET_ID))
     base_tables = [item for item in all_items if item.table_type == 'TABLE']
-    print(f"-> Tìm thấy {len(base_tables)} Base Tables (bỏ qua {len(all_items) - len(base_tables)} Views).")
+    table_names = [t.table_id for t in base_tables]
+    print(f"-> Tìm thấy {len(base_tables)} Base Tables trong dataset '{DATASET_ID}'.")
 
-    # 2. Lấy lịch sử JOBS (180d)
-    print("\n2. Đang đọc lịch sử Query (180d) từ BigQuery JOBS...")
+    # 3. Lịch sử Query (JOBS 180d)
+    print("\n3. Đang đọc lịch sử Query (180d) từ BigQuery JOBS...")
     query_jobs = f"""
     SELECT 
         REGEXP_EXTRACT(query, r'(?i)(?:{DATASET_ID}|`{DATASET_ID}`)\.(`?[\w]+`?)') AS raw_tbl,
@@ -58,22 +140,25 @@ def analyze_warehouse_tables():
     except Exception as e:
         print(f"[!] Lỗi truy vấn JOBS: {e}")
 
-    # 3. Quét tham chiếu trong SPs và Views
-    print("\n3. Đang quét tham chiếu Table trong Code SPs (staging_temp) & Views (warehouse_view)...")
+    # 4. Quét tham chiếu CHỈ TRONG ACTIVE SPs & Active Views
+    print("\n4. Đang quét tham chiếu Table trong Active SPs (107 SPs) & Active Views (warehouse_view)...")
     sp_files = glob.glob(r'd:\bigquery\staging_temp\*.sql')
     view_files = glob.glob(r'd:\bigquery\warehouse_view\*.sql')
     
-    table_names = [t.table_id for t in base_tables]
     referenced_in_code = {}
 
     for sf in sp_files:
+        sp_base = os.path.splitext(os.path.basename(sf))[0].lower()
+        if sp_base not in active_sp_set:
+            continue
+            
         sp_name = os.path.basename(sf)
         with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read().lower()
         for tn in table_names:
             tn_lower = tn.lower()
             if f"warehouse.{tn_lower}" in content or f"`warehouse`.`{tn_lower}`" in content or f"`{tn_lower}`" in content:
-                referenced_in_code.setdefault(tn, set()).add(f"SP: {sp_name}")
+                referenced_in_code.setdefault(tn, set()).add(f"Active SP: {sp_name}")
 
     for vf in view_files:
         v_name = os.path.basename(vf)
@@ -82,89 +167,36 @@ def analyze_warehouse_tables():
         for tn in table_names:
             tn_lower = tn.lower()
             if f"warehouse.{tn_lower}" in content or f"`warehouse`.`{tn_lower}`" in content:
-                referenced_in_code.setdefault(tn, set()).add(f"View: {v_name}")
+                referenced_in_code.setdefault(tn, set()).add(f"Active View: {v_name}")
 
-    print(f"-> {len(referenced_in_code)} Base Tables được tham chiếu trực tiếp trong Code SP/View.")
+    print(f"-> {len(referenced_in_code)} Base Tables được tham chiếu trực tiếp trong Active SP/View.")
 
-    # 4. Lấy chi tiết Metadata của từng Base Table
-    print("\n4. Đang tải Metadata (Created, Modified, Rows, Size) cho từng Base Table...")
+    # 5. Đọc thông tin song song 30 Threads
+    print("\n5. Đang tải song song Metadata 30 threads...")
     table_results = []
     
-    for idx, item in enumerate(base_tables, 1):
-        if idx % 30 == 0 or idx == len(base_tables):
-            print(f"   └─ Đã xử lý {idx}/{len(base_tables)} tables...")
-            
-        try:
-            t_obj = client.get_table(item.reference)
-            t_id = t_obj.table_id
-            
-            created_str = t_obj.created.strftime('%Y-%m-%d %H:%M:%S') if t_obj.created else ''
-            modified_str = t_obj.modified.strftime('%Y-%m-%d %H:%M:%S') if t_obj.modified else ''
-            
-            num_rows = t_obj.num_rows if t_obj.num_rows is not None else 0
-            size_mb = round((t_obj.num_bytes or 0) / (1024 * 1024), 2)
-            
-            job_info = table_job_usage.get(t_id)
-            has_job_query = job_info is not None
-            last_queried_str = job_info['last_queried'].strftime('%Y-%m-%d %H:%M:%S') if has_job_query else 'Không query trong 180d'
-            users_str = job_info['user_emails'] if has_job_query else 'Không có'
-            
-            code_refs = referenced_in_code.get(t_id, set())
-            has_code_ref = len(code_refs) > 0
-            code_ref_str = ", ".join(sorted(list(code_refs))) if has_code_ref else 'Không có'
-            
-            is_active = has_job_query or has_code_ref
-            
-            sources = []
-            if has_code_ref:
-                sources.append("Trong Code SP/View")
-            if has_job_query:
-                sources.append("Query history 180d")
-            source_str = " + ".join(sources) if sources else "Không có"
-            
-            if is_active:
-                status = 'Active (Đang sử dụng)'
-            else:
-                status = 'Lâu chưa query / Unused'
-                
-            table_results.append({
-                'STT': idx,
-                'Tên Base Table': t_id,
-                'Dataset': DATASET_ID,
-                'Trạng thái': status,
-                'Nguồn ghi nhận Usage': source_str,
-                'Số dòng (Rows)': num_rows,
-                'Dung lượng (MB)': size_mb,
-                'Ngày tạo (Created)': created_str,
-                'Lần cuối cập nhật dữ liệu (Modified)': modified_str,
-                'Lần cuối Query (JOBS 180d)': last_queried_str,
-                'Tài khoản/BI Tool query': users_str,
-                'Tham chiếu trong Code (SP/View)': 'Có' if has_code_ref else 'Không',
-                'Chi tiết Code tham chiếu': code_ref_str
-            })
-            
-        except Exception as e:
-            print(f"Lỗi lấy thông tin table {item.table_id}: {e}")
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        futures = [executor.submit(fetch_table_info, item, table_job_usage, referenced_in_code) for item in base_tables]
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                table_results.append(res)
 
     df = pd.DataFrame(table_results)
-    
+    df.sort_values(by='Tên Base Table', inplace=True)
+    df.insert(0, 'STT', range(1, len(df) + 1))
+
     active_count = len(df[df['Trạng thái'].str.startswith('Active')])
     unused_count = len(df) - active_count
     
     print("\n================ KẾT QUẢ TỔNG HỢP WAREHOUSE BASE TABLES ================")
-    print(f"Tổng số Base Tables trong dataset 'warehouse': {len(df)}")
+    print(f"Tổng số Base Tables trong 'warehouse': {len(df)}")
     print(f"  - Base Tables ĐANG SỬ DỤNG (Active): {active_count}")
     print(f"  - Base Tables LÂU CHƯA QUERY / UNUSED: {unused_count}")
     print("=========================================================================")
 
-    # 5. Xuất Excel định dạng chuẩn đẹp
+    # 6. Xuất Excel
     excel_path = EXCEL_REPORT_PATH
-    try:
-        if os.path.exists(excel_path):
-            os.remove(excel_path)
-    except Exception:
-        excel_path = r'd:\bigquery\danh_sach_table_warehouse_usage_moi.xlsx'
-
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Warehouse Tables Usage')
         
@@ -209,25 +241,25 @@ def analyze_warehouse_tables():
                 if use_zebra:
                     cell.fill = zebra_fill
                     
-                if col_num in [1, 3, 5, 8, 9, 10, 11, 12]:
+                if col_num in [1, 3, 5, 7, 8, 9, 10, 11]:
                     cell.alignment = center_align
-                elif col_num in [6, 7]: # Rows, Size MB
+                elif col_num in [5, 6]:
                     cell.alignment = right_align
-                elif col_num == 4: # Trang thai
+                elif col_num == 4:
                     cell.alignment = center_align
                     if is_active_row:
-                        cell.font = Font(name='Segoe UI', size=10, color='385723', bold=True) # Green
+                        cell.font = Font(name='Segoe UI', size=10, color='385723', bold=True)
                     else:
-                        cell.font = Font(name='Segoe UI', size=10, color='C00000', italic=True) # Red
+                        cell.font = Font(name='Segoe UI', size=10, color='C00000', italic=True)
                 else:
                     cell.alignment = left_align
                     
         for col in worksheet.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)
             col_letter = get_column_letter(col[0].column)
-            worksheet.column_dimensions[col_letter].width = max(max_len + 4, 12)
+            worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-    print(f"\n[+] Đã xuất báo cáo Excel kiểm tra WAREHOUSE TABLES tại: {excel_path}")
+    print(f"\n[+] Đã xuất báo cáo Excel Warehouse Tables tại: {EXCEL_REPORT_PATH}")
 
 if __name__ == '__main__':
     analyze_warehouse_tables()

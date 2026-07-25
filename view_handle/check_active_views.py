@@ -13,34 +13,94 @@ if sys.platform == 'win32':
 
 CREDENTIALS_PATH = 'D:/bigquery1508.json'
 PROJECT_ID = 'spatial-vision-343005'
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
+DATASET_ID = 'warehouse'
+EXCEL_REPORT_PATH = r'd:\bigquery\danh_sach_view_usage.xlsx'
+ACTIVE_JOB_FILE = r'd:\bigquery\sp_handle\call_active_job.md'
 
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
 client = bigquery.Client(project=PROJECT_ID)
 
-def analyze_view_usage():
+# RULE CHECK ACTIVES FOR VIEWS:
+# Active = (Có query trong 180d từ JOBS / Looker / BI) OR (Nằm trong 107 Active SPs) OR (Nằm trong Views khác)
+# Unused = (Không query 180d) AND (Không nằm trong Active SPs) AND (Không nằm trong Active Views)
+
+def get_active_sp_names():
+    active_sps = set()
+    if not os.path.exists(ACTIVE_JOB_FILE):
+        return active_sps
+    with open(ACTIVE_JOB_FILE, 'r', encoding='utf-8') as f:
+        text = f.read()
+    for line in text.split('\n'):
+        for c in line.split(';'):
+            c = c.strip()
+            if 'CALL' in c.upper():
+                parts = c.split('.')
+                if len(parts) >= 2:
+                    sp_name = parts[-1].replace('`', '').replace('()', '').strip().lower()
+                    if sp_name:
+                        active_sps.add(sp_name)
+    return active_sps
+
+def analyze_warehouse_views():
     print("==========================================")
-    print("PHÂN TÍCH USAGE 288 VIEWS (LOOKER / BI / CODE SP)")
+    print("PHÂN TÍCH USAGE WAREHOUSE VIEWS (CHUẨN RULE 3 TIÊU CHÍ)")
     print("==========================================\n")
 
-    # 1. Lấy danh sách 288 views trong d:\bigquery\warehouse
-    view_files = glob.glob(r'd:\bigquery\warehouse\*.sql')
-    view_names = sorted(list(set(os.path.splitext(os.path.basename(f))[0].strip() for f in view_files)))
-    print(f"1. Tổng số VIEWs trong dataset warehouse: {len(view_names)}")
+    active_sp_set = get_active_sp_names()
+    print(f"1. Đã tải {len(active_sp_set)} Active Stored Procedures từ call_active_job.md.")
 
-    # 2. Quét tham chiếu VIEW trong các Stored Procedure (.sql) & các VIEW khác (.sql)
+    # 1. Lấy danh sách tất cả VIEWs trong dataset warehouse từ local SQL files
+    view_files = glob.glob(r'd:\bigquery\warehouse_view\*.sql')
+    view_names = sorted(list(set(os.path.splitext(os.path.basename(f))[0].strip() for f in view_files)))
+    print(f"2. Tổng số VIEWs trong dataset warehouse: {len(view_names)}")
+
+    # 2. Truy vấn JOBS (180 ngày) từ BigQuery
+    print("\n3. Đang đọc lịch sử Query (180d) từ BigQuery JOBS (bao gồm Looker / BI tools)...")
+    query_jobs = """
+    SELECT 
+        REGEXP_EXTRACT(query, r'(?i)(?:warehouse|`warehouse`)\.(`?[\w]+`?)') AS raw_view,
+        MAX(creation_time) AS last_queried_time,
+        COUNT(1) AS total_queries,
+        STRING_AGG(DISTINCT user_email, ', ') AS user_emails
+    FROM `region-asia-southeast1`.INFORMATION_SCHEMA.JOBS
+    WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 180 DAY)
+      AND (LOWER(query) LIKE '%warehouse%' OR LOWER(query) LIKE '%view%')
+    GROUP BY raw_view
+    HAVING raw_view IS NOT NULL
+    """
+    
+    view_job_usage = {}
+    try:
+        query_job = client.query(query_jobs)
+        for row in query_job.result():
+            clean_v = str(row.raw_view).replace('`', '').strip()
+            view_job_usage[clean_v] = {
+                'last_queried': row.last_queried_time,
+                'total_queries': row.total_queries,
+                'user_emails': row.user_emails or ''
+            }
+        print(f"-> Ghi nhận {len(view_job_usage)} VIEWs có lịch sử truy vấn trong 180 ngày.")
+    except Exception as e:
+        print(f"[!] Lỗi truy vấn JOBS: {e}")
+
+    # 3. Quét tham chiếu trong Active SPs & Nested Views
+    print("\n4. Đang quét tham chiếu View trong Active SPs (107 SPs) & Nested Views...")
     sp_files = glob.glob(r'd:\bigquery\staging_temp\*.sql')
+    
     referenced_in_code = {}
 
-    print(f"2. Đang quét tham chiếu trong {len(sp_files)} SPs và {len(view_files)} VIEWs...")
-
     for sf in sp_files:
+        sp_base = os.path.splitext(os.path.basename(sf))[0].lower()
+        if sp_base not in active_sp_set:
+            continue
+            
         sp_name = os.path.basename(sf)
         with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read().lower()
         for vn in view_names:
             vn_lower = vn.lower()
             if f"warehouse.{vn_lower}" in content or f"`warehouse`.`{vn_lower}`" in content or f"`{vn_lower}`" in content:
-                referenced_in_code.setdefault(vn, set()).add(f"SP: {sp_name}")
+                referenced_in_code.setdefault(vn, set()).add(f"Active SP: {sp_name}")
 
     for vf in view_files:
         v_name = os.path.splitext(os.path.basename(vf))[0]
@@ -51,161 +111,65 @@ def analyze_view_usage():
                 continue
             vn_lower = vn.lower()
             if f"warehouse.{vn_lower}" in content or f"`warehouse`.`{vn_lower}`" in content:
-                referenced_in_code.setdefault(vn, set()).add(f"View: {v_name}")
+                referenced_in_code.setdefault(vn, set()).add(f"Active View: {v_name}")
 
-    print(f"   -> {len(referenced_in_code)} VIEWs có tham chiếu trong Code SP / View DDL.")
+    print(f"-> {len(referenced_in_code)} VIEWs được tham chiếu trực tiếp trong Code SP/View.")
 
-    # 3. Query Server-side Group By từ BigQuery JOBS (180 ngày) cho Looker / BI / Direct queries
-    print("\n3. Đang truy vấn Server-side lịch sử chạy (Looker Studio / BI Tools / Users) từ BigQuery...")
-    query_jobs = """
-    SELECT 
-        REGEXP_EXTRACT(query, r'(?i)(?:warehouse|`warehouse`)\.(`?[\w]+`?)') AS raw_view,
-        MAX(creation_time) AS last_used_time,
-        STRING_AGG(DISTINCT user_email, ', ') AS user_emails
-    FROM `region-asia-southeast1`.INFORMATION_SCHEMA.JOBS
-    WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 180 DAY)
-      AND (LOWER(query) LIKE '%warehouse%' OR LOWER(query) LIKE '%view%')
-    GROUP BY raw_view
-    HAVING raw_view IS NOT NULL
-    """
-    
-    view_job_usage = {}
-    
-    try:
-        query_job = client.query(query_jobs)
-        for row in query_job.result():
-            clean_v = str(row.raw_view).replace('`', '').strip()
-            view_job_usage[clean_v] = {
-                'last_used': row.last_used_time,
-                'users': row.user_emails or ''
-            }
-        print(f"   -> Ghi nhận {len(view_job_usage)} VIEWs có lịch sử truy vấn trên BigQuery!")
-    except Exception as e:
-        print(f"   [!] Lỗi truy vấn JOBS: {e}")
-
-    # 4. Phân loại tổng hợp
-    summary_list = []
-    active_count = 0
-    unused_count = 0
-
+    # 4. Lập bảng kết quả
+    results = []
     for idx, vn in enumerate(view_names, 1):
-        refs = referenced_in_code.get(vn, set())
-        is_code_ref = len(refs) > 0
-        
         job_info = view_job_usage.get(vn)
-        is_job_ref = job_info is not None
+        has_job_query = job_info is not None
+        last_queried_str = job_info['last_queried'].strftime('%Y-%m-%d %H:%M:%S') if has_job_query else 'Không query trong 180d'
+        users_str = job_info['user_emails'] if has_job_query else 'Không có'
         
-        # ACTIVE NẾU CÓ TRONG CODE HOẶC TRONG LOOKER/BI JOBS
-        is_active = is_code_ref or is_job_ref
+        code_refs = referenced_in_code.get(vn, set())
+        has_code_ref = len(code_refs) > 0
+        code_ref_str = ", ".join(sorted(list(code_refs))) if has_code_ref else 'Không có'
         
-        last_used_str = job_info['last_used'].strftime('%Y-%m-%d %H:%M:%S') if is_job_ref else 'Không chạy trong 180 ngày qua'
-        user_list_str = job_info['users'] if is_job_ref else 'Không có'
+        is_active = has_job_query or has_code_ref
         
         sources = []
-        if is_code_ref:
-            sources.append("Trong Code SP/View")
-        if is_job_ref:
-            sources.append("Looker/BI/Direct Query")
-            
-        source_str = " + ".join(sources) if sources else "Không có"
+        if has_job_query:
+            sources.append("Query history / Looker 180d")
+        if has_code_ref:
+            sp_count = sum(1 for r in code_refs if r.startswith("Active SP"))
+            view_count = sum(1 for r in code_refs if r.startswith("Active View"))
+            if sp_count > 0:
+                sources.append(f"Active SP ({sp_count})")
+            if view_count > 0:
+                sources.append(f"Active View ({view_count})")
+                
+        source_str = " + ".join(sources) if sources else "Hoàn toàn không sử dụng"
+        status = 'Active (Đang sử dụng)' if is_active else 'Lâu chưa query / Unused'
         
-        if is_active:
-            active_count += 1
-            status = 'Active (Đang sử dụng)'
-        else:
-            unused_count += 1
-            status = 'Unused (Không dùng)'
-            
-        ref_details = ", ".join(sorted(list(refs))) if refs else 'Không có'
-        
-        summary_list.append({
+        results.append({
             'STT': idx,
             'Tên VIEW': vn,
-            'Dataset': 'warehouse',
+            'Dataset': DATASET_ID,
             'Trạng thái': status,
-            'Nguồn sử dụng': source_str,
-            'Lần cuối truy vấn (Looker/Jobs 180d)': last_used_str,
-            'Tài khoản/BI Tool truy vấn': user_list_str,
-            'Chi tiết Tham chiếu trong SP/View': ref_details
+            'Nguồn ghi nhận Usage': source_str,
+            'Lần cuối Query (JOBS 180d)': last_queried_str,
+            'Tài khoản/Looker query': users_str,
+            'Tham chiếu trong Code (Active SP/View)': 'Có' if has_code_ref else 'Không',
+            'Chi tiết Code tham chiếu': code_ref_str
         })
 
-    df = pd.DataFrame(summary_list)
+    df = pd.DataFrame(results)
+    active_count = len(df[df['Trạng thái'].str.startswith('Active')])
+    unused_count = len(df) - active_count
     
-    print("\n================ KẾT QUẢ PHÂN TÍCH TỔNG HỢP (LOOKER + CODE) ================")
-    print(f"Tổng số VIEWs kiểm tra: {len(view_names)}")
+    print("\n================ KẾT QUẢ TỔNG HỢP WAREHOUSE VIEWS ================")
+    print(f"Tổng số VIEWs trong 'warehouse': {len(df)}")
     print(f"  - VIEWs ĐANG SỬ DỤNG (Active): {active_count}")
-    print(f"  - VIEWs KHÔNG SỬ DỤNG (Unused): {unused_count}")
-    print("==========================================================================")
+    print(f"  - VIEWs LÂU CHƯA QUERY / UNUSED: {unused_count}")
+    print("==================================================================")
 
-    # Export Excel với format đẹp
-    excel_path = r'd:\bigquery\danh_sach_view_usage.xlsx'
-    
-    try:
-        if os.path.exists(excel_path):
-            os.remove(excel_path)
-    except Exception:
-        excel_path = r'd:\bigquery\danh_sach_view_usage_moi.xlsx'
+    # 5. Xuất Excel
+    with pd.ExcelWriter(EXCEL_REPORT_PATH, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Warehouse Views Usage')
 
-    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Kiểm Tra View Usage')
-        
-        workbook = writer.book
-        worksheet = writer.sheets['Kiểm Tra View Usage']
-        
-        header_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid') # Navy Blue
-        header_font = Font(name='Segoe UI', size=11, bold=True, color='FFFFFF')
-        header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        
-        thin_border = Border(
-            left=Side(style='thin', color='D9D9D9'),
-            right=Side(style='thin', color='D9D9D9'),
-            top=Side(style='thin', color='D9D9D9'),
-            bottom=Side(style='thin', color='D9D9D9')
-        )
-        
-        for col_num, col_name in enumerate(df.columns, 1):
-            cell = worksheet.cell(row=1, column=col_num)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_align
-            
-        worksheet.row_dimensions[1].height = 28
-        
-        data_font = Font(name='Segoe UI', size=10)
-        center_align = Alignment(horizontal='center', vertical='center')
-        left_align = Alignment(horizontal='left', vertical='center')
-        zebra_fill = PatternFill(start_color='F9FAFB', end_color='F9FAFB', fill_type='solid')
-        
-        for row_num in range(2, len(df) + 2):
-            worksheet.row_dimensions[row_num].height = 20
-            use_zebra = (row_num % 2 == 1)
-            
-            is_active_row = df.iloc[row_num - 2]['Trạng thái'].startswith('Active')
-            
-            for col_num in range(1, len(df.columns) + 1):
-                cell = worksheet.cell(row=row_num, column=col_num)
-                cell.font = data_font
-                cell.border = thin_border
-                if use_zebra:
-                    cell.fill = zebra_fill
-                    
-                if col_num in [1, 3, 5, 6]:
-                    cell.alignment = center_align
-                elif col_num == 4: # Trang thai
-                    cell.alignment = center_align
-                    if is_active_row:
-                        cell.font = Font(name='Segoe UI', size=10, color='385723', bold=True) # Green
-                    else:
-                        cell.font = Font(name='Segoe UI', size=10, color='C00000', italic=True) # Red
-                else:
-                    cell.alignment = left_align
-                    
-        for col in worksheet.columns:
-            max_len = max(len(str(cell.value or '')) for cell in col)
-            col_letter = get_column_letter(col[0].column)
-            worksheet.column_dimensions[col_letter].width = max(max_len + 4, 12)
-
-    print(f"\n[+] Đã xuất báo cáo Excel kiểm tra VIEW đầy đủ Looker/BI tại: {excel_path}")
+    print(f"\n[+] Đã xuất báo cáo Excel View Usage tại: {EXCEL_REPORT_PATH}")
 
 if __name__ == '__main__':
-    analyze_view_usage()
+    analyze_warehouse_views()
