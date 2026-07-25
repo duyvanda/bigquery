@@ -22,8 +22,8 @@ os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
 client = bigquery.Client(project=PROJECT_ID)
 
 # RULE CHECK ACTIVES:
-# Active = (Có query nghiệp vụ trong 180d) OR (Nằm trong 107 Active SPs) OR (Nằm trong Active Views)
-# Bỏ qua các query tự động 'SELECT * FROM ...' do script sao lưu backup chạy!
+# Active = (Có query nghiệp vụ trong 180d) OR (Nằm trong 107 Active SPs) OR (Nằm trong 212 Active Views trên BQ)
+# Unused = (Không query 180d) AND (Không nằm trong Active SPs) AND (Không nằm trong Active Views)
 
 def get_active_sp_names():
     active_sps = set()
@@ -41,6 +41,14 @@ def get_active_sp_names():
                     if sp_name:
                         active_sps.add(sp_name)
     return active_sps
+
+def get_active_view_names():
+    # Lấy 212 Active Views đang thực sự tồn tại trên BigQuery warehouse
+    views = set()
+    for item in client.list_tables('warehouse'):
+        if item.table_type == 'VIEW':
+            views.add(item.table_id.lower())
+    return views
 
 def fetch_table_info(item, table_job_usage, referenced_in_code):
     try:
@@ -98,22 +106,26 @@ def fetch_table_info(item, table_job_usage, referenced_in_code):
 
 def analyze_staging_tables():
     print("==========================================")
-    print("PHÂN TÍCH CHUẨN XÁC USAGE TABLES DATASET STAGING (LOẠI BỎ QUERY BACKUP)")
+    print("PHÂN TÍCH CHUẨN XÁC USAGE TABLES DATASET STAGING (212 ACTIVE VIEWS & 107 ACTIVE SPs)")
     print("==========================================\n")
 
     # 1. Đọc danh sách Active SPs từ call_active_job.md
     active_sp_set = get_active_sp_names()
     print(f"1. Đã tải {len(active_sp_set)} Active Stored Procedures từ call_active_job.md.")
 
-    # 2. Lấy danh sách tất cả Base Tables trong dataset 'staging'
-    print(f"2. Đang lấy danh sách Base Tables từ BigQuery Dataset '{DATASET_ID}'...")
+    # 2. Đọc danh sách Active Views từ BigQuery Production
+    active_view_set = get_active_view_names()
+    print(f"2. Đã tải {len(active_view_set)} Active Views đang sống trên BigQuery Production (warehouse).")
+
+    # 3. Lấy danh sách tất cả Base Tables trong dataset 'staging'
+    print(f"3. Đang lấy danh sách Base Tables từ BigQuery Dataset '{DATASET_ID}'...")
     all_items = list(client.list_tables(DATASET_ID))
     base_tables = [item for item in all_items if item.table_type == 'TABLE']
     table_names = [t.table_id for t in base_tables]
     print(f"-> Tìm thấy {len(base_tables)} Base Tables trong dataset '{DATASET_ID}'.")
 
-    # 3. Lịch sử Query (JOBS 180 ngày) - BỎ QUA SELECT * SAO LƯU
-    print("\n3. Đang đọc lịch sử Query (180d) từ BigQuery JOBS...")
+    # 4. Lịch sử Query (JOBS 180 ngày) - BỎ QUA SELECT * SAO LƯU
+    print("\n4. Đang đọc lịch sử Query (180d) từ BigQuery JOBS...")
     query_jobs = f"""
     SELECT 
         REGEXP_EXTRACT(query, r'(?i)(?:{DATASET_ID}|`{DATASET_ID}`)\.(`?[\w]+`?)') AS raw_tbl,
@@ -141,8 +153,8 @@ def analyze_staging_tables():
     except Exception as e:
         print(f"[!] Lỗi truy vấn JOBS: {e}")
 
-    # 4. Quét tham chiếu CHỈ TRONG ACTIVE SPs & Active Views
-    print("\n4. Đang quét tham chiếu Table trong Active SPs (107 SPs) & Active Views (warehouse_view)...")
+    # 5. Quét tham chiếu CHỈ TRONG 107 ACTIVE SPs & 212 ACTIVE VIEWS
+    print("\n5. Đang quét tham chiếu Table trong Active SPs (107 SPs) & Active Views (212 Views)...")
     sp_files = glob.glob(r'd:\bigquery\staging_temp\*.sql')
     view_files = glob.glob(r'd:\bigquery\warehouse_view\*.sql')
     
@@ -162,6 +174,10 @@ def analyze_staging_tables():
                 referenced_in_code.setdefault(tn, set()).add(f"Active SP: {sp_name}")
 
     for vf in view_files:
+        v_base = os.path.splitext(os.path.basename(vf))[0].lower()
+        if v_base not in active_view_set:
+            continue # Bỏ qua các file SQL view đã bị DROP khỏi BigQuery!
+            
         v_name = os.path.basename(vf)
         with open(vf, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read().lower()
@@ -172,8 +188,8 @@ def analyze_staging_tables():
 
     print(f"-> {len(referenced_in_code)} Tables được tham chiếu trực tiếp trong Active SP/View.")
 
-    # 5. Đọc thông tin song song 30 Threads
-    print("\n5. Đang tải song song Metadata 30 threads...")
+    # 6. Đọc thông tin song song 30 Threads
+    print("\n6. Đang tải song song Metadata 30 threads...")
     table_results = []
     
     with ThreadPoolExecutor(max_workers=30) as executor:
@@ -190,13 +206,13 @@ def analyze_staging_tables():
     active_count = len(df[df['Trạng thái'].str.startswith('Active')])
     unused_count = len(df) - active_count
     
-    print("\n================ KẾT QUẢ TỔNG HỢP STAGING TABLES CHUẨN KHOA HỌC ================")
+    print("\n================ KẾT QUẢ TỔNG HỢP STAGING TABLES CHUẨN XÁC ================")
     print(f"Tổng số Base Tables còn lại trong 'staging': {len(df)}")
     print(f"  - Tables ĐANG SỬ DỤNG TRỰC TIẾP (Active): {active_count}")
     print(f"  - Tables LÂU CHƯA QUERY / UNUSED THẬT SỰ: {unused_count}")
-    print("==================================================================================")
+    print("===========================================================================")
 
-    # 6. Xuất Excel
+    # 7. Xuất Excel
     excel_path = EXCEL_REPORT_PATH
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Staging Tables Usage')
@@ -260,7 +276,7 @@ def analyze_staging_tables():
             col_letter = get_column_letter(col[0].column)
             worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-    print(f"\n[+] Đã xuất báo cáo Excel chuẩn loại trừ query backup tại: {EXCEL_REPORT_PATH}")
+    print(f"\n[+] Đã xuất báo cáo Excel chuẩn tại: {EXCEL_REPORT_PATH}")
 
 if __name__ == '__main__':
     analyze_staging_tables()
