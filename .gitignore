@@ -1,0 +1,31 @@
+# Secrets & Credentials (BẢO MẬT KEY MẬT)
+*.json
+*.pem
+*.key
+*.pfx
+*.p12
+.env
+.env.*
+
+# Data & Backups (BẢO MẬT DỮ LIỆU CHẬM / FILE THÔ)
+*.csv
+*.xlsx
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# System / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch & Temp logs
+*.log

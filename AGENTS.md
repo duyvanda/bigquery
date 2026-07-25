@@ -1,0 +1,4 @@
+- BigQuery Authentication: D:/bigquery1508.json
+- BigQuery project: spatial-vision-343005
+- BigQuery Dataset: "staging" và "warehouse"
+- BigQuery staging_temp: for store procedure processing (ETL)
