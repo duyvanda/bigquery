@@ -11,6 +11,8 @@ from google.cloud import bigquery
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
+SP_CACHE_PATH = r'd:\bigquery\cache\sp_jobs_cache.csv'
+
 CREDENTIALS_PATH = 'D:/bigquery1508.json'
 PROJECT_ID = 'spatial-vision-343005'
 ACTIVE_JOB_FILE = r'd:\bigquery\sp_handle\call_active_job.md'
@@ -24,7 +26,7 @@ def check_active_stores():
     Rule Active SP = (Nằm trong call_active_job.md) AND (Có thực thi thực tế JOBS 180d).
     Fix: scan toàn bộ query string để bắt multi-statement CALL scripts.
     """
-    client = bigquery.Client(project=PROJECT_ID)
+    client = bigquery.Client(project=PROJECT_ID) if not os.path.exists(SP_CACHE_PATH) else None
     
     print("==========================================")
     print("PHÂN TÍCH STORED PROCEDURES - ĐIỀU KIỆN KÉP (MULTI-STATEMENT SCRIPT SAFE)")
@@ -47,31 +49,41 @@ def check_active_stores():
 
     print(f"1. Số SPs được kê khai trong call_active_job.md: {len(called_sps)}")
 
-    # 2. Kéo toàn bộ JOBS có CALL/SCRIPT trong 180d về phía client để scan
-    region = 'region-asia-southeast1'
-    print("\n2. Đang kéo JOBS history (180d) có lệnh CALL từ BigQuery...")
-    query_jobs = f"""
-    SELECT 
-        query,
-        MAX(creation_time) AS last_time
-    FROM `{region}`.INFORMATION_SCHEMA.JOBS
-    WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 180 DAY)
-      AND (LOWER(query) LIKE '%call%' AND LOWER(query) LIKE '%staging_temp%')
-    GROUP BY query
-    """
+    # 2. Đọc SP usage từ cache local (chạy cache\fetch_jobs_cache.py trước nếu chưa có)
+    if os.path.exists(SP_CACHE_PATH):
+        print(f"\n2. Đọc SP JOBS cache từ local: {SP_CACHE_PATH}")
+        df_cache = pd.read_csv(SP_CACHE_PATH, parse_dates=['last_used_time'])
+        # Filter lại 180 ngày tính từ NOW (cache có thể cũ hơn ngày fetch)
+        cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=180)
+        df_cache['last_used_time'] = pd.to_datetime(df_cache['last_used_time'], utc=True)
+        df_cache = df_cache[df_cache['last_used_time'] >= cutoff]
+        print(f"   -> Cache có {len(df_cache)} SP records trong 180 ngày gần nhất.")
+    else:
+        print(f"\n2. Cache chưa có, đang query BigQuery (chạy cache/fetch_jobs_cache.py để tạo cache)...")
+        sql = """
+        SELECT name, MAX(last_used_time) AS last_used_time, STRING_AGG(DISTINCT users) AS users
+        FROM (
+            SELECT sp_name AS name, MAX(creation_time) AS last_used_time, user_email AS users
+            FROM `region-asia-southeast1`.INFORMATION_SCHEMA.JOBS,
+            UNNEST(REGEXP_EXTRACT_ALL(LOWER(query), r'staging_temp[.`]+([a-z0-9_]+)')) AS sp_name
+            WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 180 DAY)
+            GROUP BY name, users
+        )
+        GROUP BY name
+        """
+        rows = list(client.query(sql).result())
+        df_cache = pd.DataFrame([dict(r) for r in rows])
+        df_cache.columns = ['name', 'last_used_time', 'users']
+        os.makedirs(os.path.dirname(SP_CACHE_PATH), exist_ok=True)
+        df_cache.to_csv(SP_CACHE_PATH, index=False, encoding='utf-8-sig')
+        print(f"   -> Đã lưu cache: {SP_CACHE_PATH}")
 
-    job_rows = list(client.query(query_jobs).result())
-    print(f"   -> Đã tải {len(job_rows)} JOBS records có CALL staging_temp.")
-
-    # 3. Scan từng query string để tìm tên SP nào được CALL thực tế
+    # 3. Map cache về executed_sps dict
     executed_sps = {}  # sp_name -> last_executed_time
-    for row in job_rows:
-        q_lower = str(row.query).lower()
-        c_time = row.last_time
-        for sp in called_sps:
-            if sp in q_lower:
-                if sp not in executed_sps or c_time > executed_sps[sp]:
-                    executed_sps[sp] = c_time
+    for _, row in df_cache.iterrows():
+        sp = str(row['name']).strip().lower()
+        if sp in called_sps:
+            executed_sps[sp] = row['last_used_time']
 
     print(f"   -> Số SPs trong call_active_job.md CÓ CHẠY THỰC TẾ 180D: {len(executed_sps)} / {len(called_sps)}")
 
